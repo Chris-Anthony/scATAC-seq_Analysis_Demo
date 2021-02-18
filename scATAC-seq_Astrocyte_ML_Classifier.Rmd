@@ -1,0 +1,315 @@
+---
+title: "Single Cell ATAC-seq of Mouse Brain Cells"
+author: "Christian Chua"
+date: "`r date()`"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+---
+
+# scATAC-seq Analysis
+### Data Exploration
+
+```{r data_exploration, warning=FALSE, message=FALSE}
+# read in the data
+mmus_brain_data <- read.csv(
+  file = "atac.mm10.counts.csv",
+  header = TRUE,
+  row.names = 1
+)
+
+# number of peak calls per sample
+nCount <- as.data.frame(colSums(mmus_brain_data))
+colnames(nCount) <- "nCount"
+
+# number of genes per sample
+nFeature <- NULL
+for (cell in colnames(mmus_brain_data)){
+  nFeature <- rbind(nFeature, nrow(mmus_brain_data) - sum(mmus_brain_data[[cell]] > 0))
+}
+nFeature <- as.data.frame(nFeature)
+colnames(nFeature) <- "nFeature"
+rownames(nFeature) <- colnames(mmus_brain_data)
+
+# view features versus counts
+options(scipen=5)
+plot(nCount$nCount, nFeature$nFeature, xlab="nCount", ylab="nFeature")
+
+# view count and feature distributions
+# library(vioplot)
+# vioplot(nCount$nCount)
+# vioplot(nFeature$nFeature)
+```
+### Data Normalization and Log-Transformation
+
+```{r analysis, warning=FALSE, message=FALSE}
+library(Matrix)
+library(readr)
+library(dplyr)
+
+# convert to dataframe
+mat <- as.data.frame(mmus_brain_data)
+
+# binarize the data
+mat[mat >0] <- 1 
+
+# log transformation data
+transform.idf <- function(data) {
+  data <- as.matrix(data)
+  
+  # normalize the data
+  npeaks <- Matrix::colSums(data)
+  tf <- t(t(data) / npeaks)
+  
+  # log transformation
+  idf <- log(1+ ncol(data) / Matrix::rowSums(data))
+  normed.data <- Diagonal(length(idf), idf) %*% tf
+  normed.data[which(is.na(normed.data))] <- 0
+  return(normed.data)
+}
+
+mat <- transform.idf(mat)
+# range(mat)
+# dim(mat)
+```
+### Dimensional Reduction using Latent Semantic Indexing
+
+```{r dimensional_reduction}
+library(irlba)
+set.seed(8)
+
+# latent semantic indexing (LSI)
+mat.lsi<- irlba(mat, 50)
+
+# singular value decomposition
+d_diag <- matrix(0, 50, 50)
+diag(d_diag) <- mat.lsi$d # rank (number of genes) approximation of peak matrix
+mat_pcs <- t(d_diag %*% t(mat.lsi$v)) # projections in latent semantic space
+rownames(mat_pcs) <- colnames(mat)
+
+# principal components
+# dim(mat_pcs)
+plot(mat_pcs[,1], mat_pcs[,2])
+```
+
+### Clustering
+
+```{r K-nearest_neighbor}
+library(RANN)
+
+# KNN 
+knn.info<- RANN::nn2(mat_pcs, k = 30)
+
+# convert to adjacency matrix
+knn <- knn.info$nn.idx
+
+adj <- matrix(0, nrow(mat_pcs), nrow(mat_pcs))
+rownames(adj) <- colnames(adj) <- rownames(mat_pcs)
+
+for(i in seq_len(nrow(mat_pcs))) {
+    adj[i,rownames(mat_pcs)[knn[i,]]] <- 1
+}
+```
+```{r clustering, warning=FALSE, message=FALSE}
+# convert to graph
+library(igraph)
+g <- simplify(igraph::graph.adjacency(adj, mode="undirected"))
+
+# Louvain clustering
+km <- igraph::cluster_louvain(g)
+
+com <- km$membership
+names(com) <- km$names
+
+# distribution of cells per cluster
+# head(com)
+table(com)
+```
+## Non-linear Dimensional Reduction (tSNE)
+
+```{r tsne_plot, warning=FALSE, message=FALSE}
+library(Rtsne)
+library(ggplot2)
+library(tibble)
+set.seed(8)
+
+# t-distributed stochastic neighbor embedding 
+mat_tsne <- Rtsne(mat_pcs,  dims = 2, perplexity = 30, verbose = TRUE, 
+               max_iter = 1000, check_duplicates = FALSE, is_distance = FALSE, 
+               theta = 0.5, pca = FALSE, exaggeration_factor = 12)
+
+# convert to dataframe
+df_tsne <- as.data.frame(mat_tsne$Y)
+colnames(df_tsne) <- c("tSNE1", "tSNE2")
+df_tsne$barcode <- rownames(mat_pcs)
+
+# add cluster ids
+df_tsne <- left_join(df_tsne, enframe(com), by = c("barcode" = "name")) %>%
+        dplyr::rename(cluster = value) %>%
+        mutate(cluster = as.factor(cluster))
+
+# tsne plot
+ggplot(df_tsne, aes(tSNE1, tSNE2)) + 
+        geom_point(aes(col = cluster), size = 0.5) +
+        theme_bw(base_size = 14)
+```
+
+### Cluster Identification
+
+```{r cluster_id}
+# read in cell labels file
+cell_labels <- read.delim(
+  file = "ATAC-seq.cell.labels.txt",
+  header = FALSE
+)
+
+# reformat dataframe
+df_tsne_plot <- df_tsne
+df_tsne_plot["type"] <- cell_labels
+df_tsne_plot$type <- as.factor(df_tsne_plot$type)
+# levels(df_tsne_plot$cluster)
+
+# replace oligodendrocytes_polydendrocytes string
+levels(df_tsne_plot$type)[levels(df_tsne_plot$type)=="oligodendrocytes_polydendrocytes"] <- "ODC_PDC"
+categories <- levels(df_tsne_plot$type)
+
+# plot distrbution of cell types in each cluster
+par(mfrow=c(2,2))
+
+# cluster 1 is astrocytes
+for (i in levels(df_tsne_plot$cluster)) {
+  plot(subset(df_tsne_plot, cluster == i)$type, main = paste0("cluster ", i), cex.names=0.70, las = 2)
+}
+```
+
+
+### Discussion
+
+I normalized and log-transformed the peak matrix followed by latent semantic indexing to reduce the dimensions. Clustering was then performed using the k-nearest neighbor method. Visualization of the 836 single cells was done using a tSNE plot. There is a clear separation between cell types (see scatter plot matrix in the Machine Learning section). However, there is a group of excitatory neurons that is clustering together with the inhibitory neurons. These cells may have been mis-labeled. However, the abundance and clear clustering suggest another possibility. This group of cells is of a different type than either inhibitory neurons or excitatory neurons.  Furthermore, there are several cells identified as inhibitory neurons that clustering together with the other cell types. These cells may have been mis-identified.
+
+# Machine Learning
+
+```{r tsne_covert}
+# pull cell type information
+df_tsne_sub <- df_tsne_plot["type"]
+row.names(df_tsne_sub) <- df_tsne_plot$barcode
+
+# convert dataframe. sample barcode are rownames
+df_tsne_ml <- df_tsne
+rownames(df_tsne_ml) <- df_tsne_ml$barcode
+df_tsne_ml <- merge(df_tsne_ml, df_tsne_sub, by=0)
+rownames(df_tsne_ml) <- df_tsne_ml$barcode
+df_tsne_ml <- df_tsne_ml[c("tSNE1", "tSNE2", "type")]
+ML <- df_tsne_ml
+```
+
+### Split Data Into Training and Validation Sets
+
+```{r val_data, warning=FALSE, message=FALSE}
+# separate data into validation and training sets
+library(caret)
+validation_index <- createDataPartition(ML$type, p = 0.80, list = FALSE)
+
+validation <- ML[-validation_index,]
+ML <- ML[validation_index,]
+```
+### Training Set Data Exploration
+
+```{r training_data}
+# view data
+# dim(ML)
+# sapply(ML, class)
+# levels(ML$type)
+
+# proportion of cell types
+percentage <- prop.table(table(ML$type)) * 100
+cbind(freq=table(ML$type), percentage=percentage)
+# summary(ML)
+```
+```{r visualization, warning=FALSE, message=FALSE}
+# univariate plots
+x <- ML[,1:2]
+y <- ML[,3]
+
+# variation over tsne1 and tsne2
+par(mfrow=c(1,2))
+for (i in 1:2) {
+  boxplot(x[,i], main=names(ML)[i])
+}
+
+# distribution of cell types
+par(mfrow=c(1,1))
+plot(y, cex.names=0.75)
+
+library("ellipse")
+# multivariate plots
+featurePlot(x=x, y=y, plot="ellipse")
+featurePlot(x=x, y=y, plot="box")
+
+# density plots, distributions of cell types over tsne1 and tsne2
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+featurePlot(x=x, y=y, plot="density", scales=scales)
+```
+
+### Training Different Models
+
+```{r algorithms}
+control <- trainControl(method="cv", number = 10)
+metric <- "Accuracy"
+
+## the models
+
+# linear discriminant analysis
+set.seed(8)
+fit.lda <- train(type~., data=ML, method="lda", metric=metric, trControl=control)
+
+# classification and regressiontrees
+set.seed(8)
+fit.cart <- train(type~., data=ML, method="rpart", metric=metric, trControl=control)
+
+# k-Nearest Neighbors (kNN)
+set.seed(8)
+fit.knn <- train(type~., data=ML, method="knn", metric=metric, trControl=control)
+
+# Support Vector Machines with a linear kernel
+set.seed(8)
+fit.svm <- train(type~., data=ML, method="svmRadial", metric=metric, trControl=control)
+
+# Random Forest
+set.seed(8)
+fit.rf <- train(type~., data=ML, method="rf", metric=metric, trControl=control)
+
+# Summarize accuracy of models
+results <- resamples(list(lda=fit.lda, cart=fit.cart, knn=fit.knn, svm=fit.svm, rf=fit.rf))
+summary(results)
+
+# compare accuracy
+dotplot(results)
+
+# summarize best model
+print(fit.rf)
+```
+### Validating the Best Model
+
+```{r validation}
+# validation of model
+predictions.rf <- predict(fit.rf, validation)
+confusionMatrix(predictions.rf, validation$type)
+```
+
+### Discussion
+
+Using the first two tSNE dimensions, I trained different classifiers using the ‘caret’ package in R to identify astrocyte cells against the other cell types. The k-nearest neighbor, support-vector networks, and random forest models had the greatest accuracy (over 90%) for the training data set. The kappa statistic is also high for each model. Kappa is a more robust measure than accuracy because it considers the probability of an agreement happening by chance. Furthermore, it gives a better estimate of model’s performance when the distribution of classes is skewed. Ultimately, I chose the random forest model to test the validation data set, which returned an accuracy greater than 95%. There is high specificity and sensitivity for every class. 
+
+Support-vector machines are better at handling outliers and provides information at the boundaries, but because our clusters are distinct, I removed this model from consideration. K-nearest neighbors requires the creation of a ‘similarity’ space and then determines a class by finding the nearest neighbor in that space. This makes KNN susceptible to noisy data, which we found is true from the mislabeled cells in question 1. Random forest is the best because it accumulates information from several decision tree algorithms with different subsets of the training data. This combats overfitting. A potential downside to random forest is that it cannot predict outside the range in the training data.
+
+# Future Directions
+
+The first analysis I would perform given more time would be to differential accessibility analysis between the clusters. Assuming that each cell type has a different pattern of accessible chromatin region, we could possibly correlate the pattern to the cell type based on our cluster identification (using the provided labels). This analysis will tell us which regions of the chromatin are likely being actively transcribe for each cell type. We should expect to see for astrocytes regions of the chromosome that contain markers for mature astrocytes, such as Aldh1L1, AldoC, and Glt1. If we see a region that is unique for astrocytes, we could perform knockout studies to understand the importance of those regions for astrocyte development and/or function.
+
+Conversely, if already know what pattern there should be for a given cell type, we could use that information to identify the cluster and compare that with the provided labels. This might help us resolve why there is a group of excitatory neurons clustering together with the inhibitory neurons.
+
+If we find the genes associated with the significantly differential regions between clusters, we could perform a GO and KEGG analysis. From this analysis, we would see the function of genes and pathways being upregulated or downregulated. Glial cells, for example, should have a higher expression of genes linked to myelin compared to neuronal cells. In particular, we can scan through these differentially accessible regions for motifs to which regulatory elements bind. Correlating this information with cell type would reveal whether there are cell-type specific regulatory elements. 
+
+Another possible analysis would be cell trajectory which predicts the direction of changes from one cell state to another. It would be interesting to see how glial cells or astrocyte differentiate from progenitor cells over pseudotime. 
